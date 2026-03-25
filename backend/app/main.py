@@ -13,7 +13,7 @@ import time
 import logging
 from contextlib import asynccontextmanager
 
-from app.config import settings
+from app.config import settings, validate_startup_settings
 from app.core.database import init_database, close_database
 from app.core.exceptions import APIException, ValidationException
 from app.api import closures, users, auth
@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting OSM Road Closures API...")
     try:
+        validate_startup_settings(settings)
         await init_database()
         logger.info("Database initialized successfully")
 
@@ -85,7 +86,7 @@ if settings.ALLOWED_HOSTS != ["*"] and len(settings.ALLOWED_HOSTS) > 0:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if settings.is_development else settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["X-Process-Time"],

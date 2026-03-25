@@ -21,7 +21,7 @@ api.interceptors.request.use((config) => {
         const token = authApi.getToken();
         if (token) {
             config.headers.Authorization = `Bearer ${token}`;
-            console.log('🔑 Auth token added to request:', token.substring(0, 20) + '...');
+            console.log('🔑 Auth token added to request');
         } else {
             console.warn('⚠️ No auth token found for API request');
         }
@@ -375,7 +375,7 @@ export const authApi = {
         if (isBrowser) {
             const token = localStorage.getItem('auth_token');
             if (token) {
-                console.log('🔍 Token retrieved from localStorage:', token.substring(0, 20) + '...');
+                console.log('🔍 Token retrieved from localStorage');
             } else {
                 console.log('❌ No token found in localStorage');
             }

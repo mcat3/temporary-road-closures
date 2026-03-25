@@ -13,9 +13,11 @@ from httpx import ASGITransport, AsyncClient
 
 from app.core.database import get_db
 from app.main import app
+from app.models.auth import OAuthState
 from app.models.user import User
 from app.schemas.user import OAuthUser
 from app.services.user_service import UserService
+from datetime import datetime, timezone, timedelta
 
 LONG_AVATAR_URL = "https://www.openstreetmap.org/" + "a" * 570  # 600+ chars total
 
@@ -104,12 +106,21 @@ class TestOAuthErrorRedirect:
         app.dependency_overrides[get_db] = lambda: mock_db
 
         try:
-            transport = ASGITransport(app=app)
+                transport = ASGITransport(app=app)
             async with AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
-                # Set the oauth_state cookie so state validation passes
-                client.cookies.set("oauth_state_osm", "test_state")
+                oauth_state = OAuthState(
+                    state="test_state",
+                    provider="osm",
+                    ip_address="1.2.3.4",
+                    user_agent="test-agent",
+                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                    redirect_path="/closures",
+                )
+                mock_db.query.return_value.filter.return_value.first.return_value = (
+                    oauth_state
+                )
 
                 # Mock OAuthService.exchange_code_for_token to raise
                 with patch("app.api.auth.OAuthService") as MockOAuthService:
@@ -127,6 +138,10 @@ class TestOAuthErrorRedirect:
                         response = await client.get(
                             "/api/v1/auth/oauth/osm/callback",
                             params={"code": "test_code", "state": "test_state"},
+                            headers={
+                                "x-forwarded-for": "1.2.3.4",
+                                "user-agent": "test-agent",
+                            },
                             follow_redirects=False,
                         )
 

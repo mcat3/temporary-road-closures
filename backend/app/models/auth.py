@@ -151,10 +151,22 @@ class OAuthState(BaseModel):
 
     redirect_uri = Column(String(255), nullable=True, doc="Custom redirect URI")
 
+    redirect_path = Column(
+        String(255), nullable=True, doc="Frontend redirect path after OAuth"
+    )
+
     # Request metadata
     ip_address = Column(
         String(45), nullable=True, doc="IP address that initiated OAuth flow"
     )
+
+    user_agent = Column(Text, nullable=True, doc="User agent that initiated OAuth")
+
+    code_verifier = Column(
+        String(255), nullable=True, doc="PKCE code verifier for OAuth flow"
+    )
+
+    nonce = Column(String(255), nullable=True, doc="OIDC nonce for OAuth flow")
 
     expires_at = Column(
         DateTime(timezone=True), nullable=False, index=True, doc="State expiration time"
@@ -164,3 +176,12 @@ class OAuthState(BaseModel):
         super().__init__(**kwargs)
         if not self.expires_at:
             self.expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    @classmethod
+    def cleanup_expired_states(cls, db: Session) -> None:
+        """
+        Remove expired OAuth state entries.
+        """
+        now = datetime.now(timezone.utc)
+        db.query(cls).filter(cls.expires_at < now).delete(synchronize_session=False)
+        db.commit()

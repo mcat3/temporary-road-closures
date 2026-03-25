@@ -66,7 +66,7 @@ async def init_database() -> None:
     """
     try:
         # Import all models to ensure they're registered
-        from app.models import closure, user  # noqa
+        from app.models import closure, user, auth  # noqa
 
         # Check if PostGIS extension is available
         with engine.connect() as conn:

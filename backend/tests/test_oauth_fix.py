@@ -106,10 +106,11 @@ class TestOAuthErrorRedirect:
         app.dependency_overrides[get_db] = lambda: mock_db
 
         try:
-                transport = ASGITransport(app=app)
+            transport = ASGITransport(app=app)
             async with AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
+                # Provide a server-side OAuthState record (cookie-based state is removed)
                 oauth_state = OAuthState(
                     state="test_state",
                     provider="osm",

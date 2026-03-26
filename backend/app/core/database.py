@@ -66,6 +66,7 @@ async def init_database() -> None:
     """
     try:
         # Import all models to ensure they're registered
+        # Ensure auth models (OAuthState) are registered before table creation
         from app.models import closure, user, auth  # noqa
 
         # Check if PostGIS extension is available

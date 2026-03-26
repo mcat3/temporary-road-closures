@@ -39,6 +39,8 @@ from app.config import settings
 router = APIRouter()
 
 
+# Allowlist of exact frontend paths for post-auth redirect.
+# This prevents open redirects or arbitrary URL injection.
 OAUTH_REDIRECT_ALLOWLIST: Set[str] = {
     "/",
     "/closures",
@@ -50,10 +52,13 @@ OAUTH_REDIRECT_ALLOWLIST: Set[str] = {
 
 
 def _is_allowed_redirect(path: str) -> bool:
+    # Only allow exact known frontend paths (no arbitrary redirect_uri override).
+    # Also allow the configured default success redirect.
     return path in OAUTH_REDIRECT_ALLOWLIST or path == settings.OAUTH_SUCCESS_REDIRECT
 
 
 def _get_client_ip(request: Request) -> str:
+    # Reuse the same IP resolution strategy as the security middleware.
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
         return forwarded_for.split(",")[0].strip()
@@ -311,17 +316,22 @@ async def oauth_login(
             provider
         )
 
+        # Bind state to the initiating request metadata
         client_ip = _get_client_ip(request)
         user_agent = request.headers.get("user-agent", "")
 
+        # Default redirect path is the configured success path
         redirect_path = settings.OAUTH_SUCCESS_REDIRECT
         if redirect and _is_allowed_redirect(redirect):
+            # Safe redirect path for frontend after login
             redirect_path = redirect
 
+        # Enforce a strict TTL for state replays
         expires_at = datetime.now(timezone.utc) + timedelta(
             minutes=settings.OAUTH_STATE_EXPIRE_MINUTES
         )
 
+        # Server-side state store with one-time use, TTL, IP/UA binding, and PKCE/nonce data
         OAuthState.create(
             db,
             state=state,
@@ -376,6 +386,7 @@ async def oauth_callback(
             detail="OAuth authentication is disabled",
         )
 
+    # Client metadata must match the initiating request (state binding)
     client_ip = _get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
 
@@ -403,12 +414,14 @@ async def oauth_callback(
             error_url = f"{settings.FRONTEND_URL}{settings.OAUTH_ERROR_REDIRECT}&reason=missing_state"
             return RedirectResponse(url=error_url)
 
+        # Reject expired state (prevents replay)
         if oauth_state.expires_at < datetime.now(timezone.utc):
             print(f"❌ OAuth callback error: Expired state for provider {provider}")
             oauth_state.delete(db)
             error_url = f"{settings.FRONTEND_URL}{settings.OAUTH_ERROR_REDIRECT}&reason=missing_state"
             return RedirectResponse(url=error_url)
 
+        # Reject mismatched IP/UA (binds state to client)
         if oauth_state.ip_address != client_ip or oauth_state.user_agent != user_agent:
             print(f"❌ OAuth callback error: State metadata mismatch for provider {provider}")
             oauth_state.delete(db)
@@ -428,11 +441,13 @@ async def oauth_callback(
 
         # Exchange code for token and get user info
         oauth_service = OAuthService()
+        # Include PKCE verifier in the token exchange
         token_data = await oauth_service.exchange_code_for_token(
             provider, code, code_verifier=code_verifier
         )
         print(f"✅ OAuth access token obtained for provider {provider}")
 
+        # OIDC-aware userinfo resolution (Google uses ID token verification)
         oauth_user = await oauth_service.get_user_info(
             provider, token_data, nonce=nonce
         )

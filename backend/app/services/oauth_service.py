@@ -1,5 +1,11 @@
 """
 OAuth service for handling authentication with external providers.
+
+This module centralizes:
+- OAuth authorization URL generation (with optional PKCE + OIDC nonce)
+- Token exchange (with optional PKCE verifier)
+- Provider-specific user info normalization
+- Google OIDC ID token verification using JWKS
 """
 
 import base64
@@ -23,6 +29,7 @@ class OAuthService:
     """
 
     def __init__(self):
+        # Provider registry (each provider encapsulates its OAuth specifics)
         self.providers = {
             "google": GoogleOAuthProvider(),
             "github": GitHubOAuthProvider(),
@@ -41,6 +48,7 @@ class OAuthService:
 
         Returns:
             tuple: (authorization_url, state, code_verifier, nonce)
+                - code_verifier/nonce are generated per attempt when supported
 
         Raises:
             AuthenticationException: If provider is not supported
@@ -50,7 +58,7 @@ class OAuthService:
                 f"OAuth provider '{provider}' is not supported"
             )
 
-        # Generate secure random state
+        # Generate secure random state (CSRF protection)
         state = secrets.token_urlsafe(32)
 
         oauth_provider = self.providers[provider]
@@ -59,12 +67,15 @@ class OAuthService:
         nonce = None
 
         if oauth_provider.supports_pkce:
+            # PKCE: generate a verifier/challenge per auth attempt
             code_verifier = self._generate_code_verifier()
             code_challenge = self._generate_code_challenge(code_verifier)
 
         if oauth_provider.supports_nonce:
+            # OIDC: nonce binds ID token to this auth request
             nonce = secrets.token_urlsafe(32)
 
+        # Build provider-specific authorization URL
         auth_url = oauth_provider.get_authorization_url(
             state, redirect_uri, code_challenge=code_challenge, nonce=nonce
         )
@@ -82,6 +93,7 @@ class OAuthService:
             code: Authorization code from OAuth callback
         Returns:
             dict: Token response data (access_token, id_token, etc.)
+                - For Google, includes id_token for OIDC verification
 
         Raises:
             AuthenticationException: If token exchange fails
@@ -92,6 +104,7 @@ class OAuthService:
             )
 
         oauth_provider = self.providers[provider]
+        # Include PKCE verifier when present
         return await oauth_provider.exchange_code_for_token(
             code, code_verifier=code_verifier
         )
@@ -108,6 +121,8 @@ class OAuthService:
 
         Returns:
             OAuthUser: User information from provider
+                - Google: derived from verified ID token claims
+                - GitHub/OSM: derived from provider API
 
         Raises:
             AuthenticationException: If user info retrieval fails
@@ -118,6 +133,7 @@ class OAuthService:
             )
 
         oauth_provider = self.providers[provider]
+        # Providers may verify ID tokens and return normalized user data
         user_data = await oauth_provider.get_user_info(token_data, nonce=nonce)
 
         return OAuthUser(
@@ -133,6 +149,7 @@ class OAuthService:
         """
         Generate a PKCE code verifier.
         """
+        # RFC 7636: high-entropy, URL-safe string
         verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=")
         return verifier.decode("ascii")
 
@@ -140,6 +157,7 @@ class OAuthService:
         """
         Generate a PKCE S256 code challenge.
         """
+        # RFC 7636: BASE64URL-ENCODE(SHA256(verifier))
         digest = hashlib.sha256(verifier.encode("ascii")).digest()
         challenge = base64.urlsafe_b64encode(digest).rstrip(b"=")
         return challenge.decode("ascii")
@@ -172,8 +190,10 @@ class BaseOAuthProvider:
         Generate authorization URL for OAuth flow.
 
         Args:
-            state: State parameter for security
+            state: State parameter for CSRF protection
             redirect_uri: Optional custom redirect URI
+            code_challenge: PKCE S256 challenge (optional)
+            nonce: OIDC nonce (optional)
 
         Returns:
             str: Authorization URL
@@ -187,10 +207,12 @@ class BaseOAuthProvider:
         }
 
         if code_challenge:
+            # RFC 7636 S256 code challenge
             params["code_challenge"] = code_challenge
             params["code_challenge_method"] = "S256"
 
         if nonce:
+            # OIDC nonce to bind ID token
             params["nonce"] = nonce
 
         # Add provider-specific parameters
@@ -216,6 +238,7 @@ class BaseOAuthProvider:
 
         Args:
             code: Authorization code
+            code_verifier: PKCE verifier (optional)
 
         Returns:
             dict: Token response data
@@ -232,6 +255,7 @@ class BaseOAuthProvider:
         }
 
         if code_verifier:
+            # PKCE: send verifier during token exchange
             data["code_verifier"] = code_verifier
 
         headers = {"Accept": "application/json"}
@@ -265,6 +289,7 @@ class BaseOAuthProvider:
 
         Args:
             token_data: Token response data
+            nonce: OIDC nonce if provider validates ID tokens
 
         Returns:
             dict: User information
@@ -330,17 +355,22 @@ class GoogleOAuthProvider(BaseOAuthProvider):
         Get user information from Google.
 
         Args:
-            access_token: Google access token
+            token_data: Token response data (must include id_token)
+            nonce: OIDC nonce expected in the ID token
 
         Returns:
             dict: Normalized user information
+                - id: Google subject (sub)
+                - email: only if email_verified=true
         """
+        # Google returns an ID token we must verify (OIDC)
         id_token = token_data.get("id_token")
         if not id_token:
             raise ExternalServiceException("Google", "ID token not found in response")
 
         claims = await self._verify_id_token(id_token, nonce=nonce)
 
+        # Only trust email if explicitly verified by Google
         email_verified = claims.get("email_verified") is True
         email = claims.get("email") if email_verified else None
         username = email.split("@")[0] if email else None
@@ -354,6 +384,9 @@ class GoogleOAuthProvider(BaseOAuthProvider):
         }
 
     async def _fetch_jwks(self) -> Dict[str, Any]:
+        """
+        Fetch Google's JSON Web Key Set for ID token signature validation.
+        """
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
@@ -367,6 +400,15 @@ class GoogleOAuthProvider(BaseOAuthProvider):
     async def _verify_id_token(
         self, id_token: str, nonce: Optional[str] = None
     ) -> Dict[str, Any]:
+        """
+        Verify Google ID token signature and required OIDC claims.
+
+        Validates:
+        - signature using JWKS
+        - issuer and audience
+        - exp/iat presence
+        - nonce match
+        """
         try:
             header = jwt.get_unverified_header(id_token)
         except jwt.InvalidTokenError as e:
@@ -376,6 +418,7 @@ class GoogleOAuthProvider(BaseOAuthProvider):
         if not kid:
             raise AuthenticationException("ID token header missing 'kid'")
 
+        # Resolve the signing key from Google's JWKS
         jwks = await self._fetch_jwks()
         jwk = next((key for key in jwks.get("keys", []) if key.get("kid") == kid), None)
         if not jwk:
@@ -384,6 +427,7 @@ class GoogleOAuthProvider(BaseOAuthProvider):
         public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
 
         try:
+            # Verify signature, issuer, audience, and required claims
             claims = jwt.decode(
                 id_token,
                 public_key,
@@ -395,10 +439,12 @@ class GoogleOAuthProvider(BaseOAuthProvider):
         except jwt.PyJWTError as e:
             raise AuthenticationException(f"Invalid ID token signature: {str(e)}")
 
+        # Enforce issuer
         issuer = claims.get("iss")
         if issuer not in self.allowed_issuers:
             raise AuthenticationException("Invalid ID token issuer")
 
+        # Enforce presence of required OIDC claims
         required_claims = ["exp", "iat", "iss", "aud", "sub", "nonce"]
         missing_claims = [claim for claim in required_claims if claim not in claims]
         if missing_claims:
@@ -406,9 +452,11 @@ class GoogleOAuthProvider(BaseOAuthProvider):
                 f"ID token missing required claims: {', '.join(missing_claims)}"
             )
 
+        # Nonce must match the initiating auth request
         if nonce is None or claims.get("nonce") != nonce:
             raise AuthenticationException("Invalid ID token nonce")
 
+        # Basic sanity check: issued-at should not be far in the future
         iat = claims.get("iat")
         now = int(time.time())
         if not isinstance(iat, (int, float)) or iat > now + 300:
@@ -439,12 +487,12 @@ class GitHubOAuthProvider(BaseOAuthProvider):
         Get user information from GitHub.
 
         Args:
-            access_token: GitHub access token
+            token_data: Token response data (must include access_token)
 
         Returns:
             dict: Normalized user information
         """
-        # Get basic user info
+        # Get basic user info from GitHub user endpoint
         user_data = await super().get_user_info(token_data, nonce=nonce)
 
         # Get user email (GitHub requires separate API call for emails)
@@ -527,7 +575,7 @@ class OSMOAuthProvider(BaseOAuthProvider):
         Get user information from OpenStreetMap.
 
         Args:
-            access_token: OSM access token
+            token_data: Token response data (must include access_token)
 
         Returns:
             dict: Normalized user information

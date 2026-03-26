@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     GOOGLE_OAUTH_URL: str = "https://accounts.google.com/o/oauth2/auth"
     GOOGLE_TOKEN_URL: str = "https://oauth2.googleapis.com/token"
     GOOGLE_USER_INFO_URL: str = "https://www.googleapis.com/oauth2/v1/userinfo"
+    # Google JWKS endpoint for ID token verification
     GOOGLE_JWKS_URL: str = "https://www.googleapis.com/oauth2/v3/certs"
 
     GITHUB_OAUTH_URL: str = "https://github.com/login/oauth/authorize"

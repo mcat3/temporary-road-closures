@@ -182,6 +182,7 @@ class OAuthState(BaseModel):
         """
         Remove expired OAuth state entries.
         """
+        # Periodic cleanup for expired one-time states
         now = datetime.now(timezone.utc)
         db.query(cls).filter(cls.expires_at < now).delete(synchronize_session=False)
         db.commit()

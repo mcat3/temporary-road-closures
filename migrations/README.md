@@ -28,6 +28,19 @@ docker exec -i osm-closures-db psql -U postgres -d osm_closures < migrations/001
 
 ## Migration History
 
+### 004_add_oauth_state_fields.sql (2026-03-26)
+
+**Purpose**: Store OAuth state metadata server-side for PKCE and OIDC verification
+
+**Changes:**
+
+- Added `redirect_path` column for safe frontend redirects
+- Added `user_agent` column to bind OAuth state to the initiating client
+- Added `code_verifier` column for PKCE S256
+- Added `nonce` column for OIDC ID token verification
+
+**Rollback**: `004_add_oauth_state_fields_rollback.sql`
+
 ### 003_widen_avatar_url_to_text.sql (2026-03-05)
 
 **Purpose**: Fix OAuth login failure caused by long avatar URLs (GitHub Issue #18)

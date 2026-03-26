@@ -5,8 +5,8 @@ Authentication endpoints for the OSM Road Closures API.
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
-from typing import Optional
-import urllib.parse
+from typing import Optional, Set
+from datetime import datetime, timezone, timedelta
 from fastapi.security import OAuth2PasswordRequestForm
 
 from app.core.database import get_db
@@ -32,10 +32,45 @@ from app.services.user_service import UserService
 from app.services.oauth_service import OAuthService
 from app.api.deps import get_current_active_user
 from app.models.user import User
+from app.models.auth import OAuthState
 from app.config import settings
 
 
 router = APIRouter()
+
+
+# Allowlist of exact frontend paths for post-auth redirect.
+# This prevents open redirects or arbitrary URL injection.
+OAUTH_REDIRECT_ALLOWLIST: Set[str] = {
+    "/",
+    "/closures",
+    "/closure-aware-routing",
+    "/docs",
+    "/login",
+    "/register",
+}
+
+
+def _is_allowed_redirect(path: str) -> bool:
+    # Only allow exact known frontend paths (no arbitrary redirect_uri override).
+    # Also allow the configured default success redirect.
+    return path in OAUTH_REDIRECT_ALLOWLIST or path == settings.OAUTH_SUCCESS_REDIRECT
+
+
+def _get_client_ip(request: Request) -> str:
+    # Reuse the same IP resolution strategy as the security middleware.
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip
+
+    if request.client:
+        return request.client.host
+
+    return "unknown"
 
 
 @router.post(
@@ -251,8 +286,8 @@ async def regenerate_api_key(
 async def oauth_login(
     provider: str,
     request: Request,
-    redirect_uri: Optional[str] = Query(None, description="Custom redirect URI"),
     redirect: Optional[str] = Query(None, description="Frontend redirect path after successful auth"),
+    db: Session = Depends(get_db),
 ):
     """
     Initiate OAuth login flow.
@@ -264,7 +299,6 @@ async def oauth_login(
 
     **Parameters:**
     - **provider**: OAuth provider name
-    - **redirect_uri**: Optional custom redirect URI (defaults to configured URI)
     - **redirect**: Optional frontend path to redirect to after successful authentication
 
     Returns a redirect to the OAuth provider's authorization page.
@@ -278,40 +312,40 @@ async def oauth_login(
 
     try:
         oauth_service = OAuthService()
-        auth_url, state = oauth_service.get_authorization_url(provider, redirect_uri)
-
-        # Store state in session/redis for validation
-        # For simplicity, we'll add it as a query parameter to the callback
-        # In production, use secure session storage
-
-        response = RedirectResponse(url=auth_url)
-
-        # Determine if we should use secure cookies based on the environment
-        # Use secure cookies in production, but allow non-secure in development
-        use_secure = not settings.DEBUG and settings.ENVIRONMENT == "production"
-
-        # Set state cookie with appropriate security settings
-        response.set_cookie(
-            key=f"oauth_state_{provider}",
-            value=state,
-            max_age=600,  # 10 minutes
-            httponly=True,
-            secure=use_secure,
-            samesite="lax",  # Allow cross-site for OAuth callback
+        auth_url, state, code_verifier, nonce = oauth_service.get_authorization_url(
+            provider
         )
 
-        # Store the frontend redirect path if provided
-        if redirect:
-            response.set_cookie(
-                key=f"oauth_redirect_{provider}",
-                value=redirect,
-                max_age=600,  # 10 minutes
-                httponly=True,
-                secure=use_secure,
-                samesite="lax",
-            )
+        # Bind state to the initiating request metadata
+        client_ip = _get_client_ip(request)
+        user_agent = request.headers.get("user-agent", "")
 
-        return response
+        # Default redirect path is the configured success path
+        redirect_path = settings.OAUTH_SUCCESS_REDIRECT
+        if redirect and _is_allowed_redirect(redirect):
+            # Safe redirect path for frontend after login
+            redirect_path = redirect
+
+        # Enforce a strict TTL for state replays
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=settings.OAUTH_STATE_EXPIRE_MINUTES
+        )
+
+        # Server-side state store with one-time use, TTL, IP/UA binding, and PKCE/nonce data
+        OAuthState.create(
+            db,
+            state=state,
+            provider=provider,
+            redirect_uri=None,
+            redirect_path=redirect_path,
+            ip_address=client_ip,
+            user_agent=user_agent,
+            code_verifier=code_verifier,
+            nonce=nonce,
+            expires_at=expires_at,
+        )
+
+        return RedirectResponse(url=auth_url)
 
     except AuthenticationException as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -352,8 +386,9 @@ async def oauth_callback(
             detail="OAuth authentication is disabled",
         )
 
-    # Get the stored redirect path (defaults to /closures if not specified)
-    frontend_redirect = request.cookies.get(f"oauth_redirect_{provider}") or "/closures"
+    # Client metadata must match the initiating request (state binding)
+    client_ip = _get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
 
     # Check for OAuth errors
     if error:
@@ -367,28 +402,55 @@ async def oauth_callback(
         return RedirectResponse(url=error_url)
 
     try:
-        # Validate state parameter
-        stored_state = request.cookies.get(f"oauth_state_{provider}")
-        if not stored_state:
+        # Validate state parameter using server-side store
+        oauth_state = (
+            db.query(OAuthState)
+            .filter(OAuthState.state == state, OAuthState.provider == provider)
+            .first()
+        )
+
+        if not oauth_state:
             print(f"❌ OAuth callback error: No stored state found for provider {provider}")
             error_url = f"{settings.FRONTEND_URL}{settings.OAUTH_ERROR_REDIRECT}&reason=missing_state"
             return RedirectResponse(url=error_url)
 
-        if stored_state != state:
-            print(f"❌ OAuth callback error: State mismatch for provider {provider}")
+        # Reject expired state (prevents replay)
+        if oauth_state.expires_at < datetime.now(timezone.utc):
+            print(f"❌ OAuth callback error: Expired state for provider {provider}")
+            oauth_state.delete(db)
+            error_url = f"{settings.FRONTEND_URL}{settings.OAUTH_ERROR_REDIRECT}&reason=missing_state"
+            return RedirectResponse(url=error_url)
+
+        # Reject mismatched IP/UA (binds state to client)
+        if oauth_state.ip_address != client_ip or oauth_state.user_agent != user_agent:
+            print(f"❌ OAuth callback error: State metadata mismatch for provider {provider}")
+            oauth_state.delete(db)
             error_url = f"{settings.FRONTEND_URL}{settings.OAUTH_ERROR_REDIRECT}&reason=invalid_state"
             return RedirectResponse(url=error_url)
 
         print(f"✅ OAuth state validation successful for provider {provider}")
 
+        code_verifier = oauth_state.code_verifier
+        nonce = oauth_state.nonce
+        frontend_redirect = (
+            oauth_state.redirect_path or settings.OAUTH_SUCCESS_REDIRECT
+        )
+
+        # One-time use: delete state after validation
+        oauth_state.delete(db)
+
         # Exchange code for token and get user info
         oauth_service = OAuthService()
-        access_token = await oauth_service.exchange_code_for_token(
-            provider, code, state
+        # Include PKCE verifier in the token exchange
+        token_data = await oauth_service.exchange_code_for_token(
+            provider, code, code_verifier=code_verifier
         )
         print(f"✅ OAuth access token obtained for provider {provider}")
 
-        oauth_user = await oauth_service.get_user_info(provider, access_token)
+        # OIDC-aware userinfo resolution (Google uses ID token verification)
+        oauth_user = await oauth_service.get_user_info(
+            provider, token_data, nonce=nonce
+        )
         print(f"✅ OAuth user info retrieved: {oauth_user.username or oauth_user.name} ({oauth_user.provider_id})")
 
         # Create or get user
@@ -409,13 +471,7 @@ async def oauth_callback(
 
         print(f"✅ OAuth login successful, redirecting to: {frontend_redirect}")
 
-        response = RedirectResponse(url=success_url)
-
-        # Clear OAuth cookies
-        response.delete_cookie(f"oauth_state_{provider}")
-        response.delete_cookie(f"oauth_redirect_{provider}")
-
-        return response
+        return RedirectResponse(url=success_url)
 
     except Exception as e:
         print(f"❌ OAuth callback error for provider {provider}: {str(e)}")

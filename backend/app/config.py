@@ -5,6 +5,7 @@ Application configuration using Pydantic settings with enhanced OpenLR support.
 from pydantic_settings import BaseSettings
 from typing import Optional, List, Dict, Any
 import os
+import logging
 
 
 class Settings(BaseSettings):
@@ -45,9 +46,8 @@ class Settings(BaseSettings):
         "http://localhost:8080",  # Alternative frontend port
         "https://closures.osm.ch",
         "https://api.closures.osm.ch",
-        "https://closures.osm.ch",
-        "*",
     ]
+    CORS_ALLOW_CREDENTIALS: bool = False
 
     # Pagination defaults
     DEFAULT_PAGE_SIZE: int = 50
@@ -109,6 +109,8 @@ class Settings(BaseSettings):
     GOOGLE_OAUTH_URL: str = "https://accounts.google.com/o/oauth2/auth"
     GOOGLE_TOKEN_URL: str = "https://oauth2.googleapis.com/token"
     GOOGLE_USER_INFO_URL: str = "https://www.googleapis.com/oauth2/v1/userinfo"
+    # Google JWKS endpoint for ID token verification
+    GOOGLE_JWKS_URL: str = "https://www.googleapis.com/oauth2/v3/certs"
 
     GITHUB_OAUTH_URL: str = "https://github.com/login/oauth/authorize"
     GITHUB_TOKEN_URL: str = "https://github.com/login/oauth/access_token"
@@ -224,3 +226,129 @@ def get_settings() -> Settings:
 
 # Use environment-specific settings
 settings = get_settings()
+
+
+DEFAULT_SECRET_KEY_PLACEHOLDERS = {
+    "your-secret-key-change-this-in-production",
+    "change-me",
+    "changeme",
+    "default",
+    "secret",
+    "secret-key",
+    "your-secret-key",
+}
+MIN_SECRET_KEY_LENGTH = 32
+
+
+def _is_default_secret_key(value: str) -> bool:
+    normalized = (value or "").strip()
+    if not normalized:
+        return True
+    return normalized.lower() in DEFAULT_SECRET_KEY_PLACEHOLDERS
+
+
+def _is_localhost_url(value: Optional[str]) -> bool:
+    if not value:
+        return True
+    lowered = value.strip().lower()
+    return lowered.startswith(
+        (
+            "http://localhost",
+            "https://localhost",
+            "http://127.0.0.1",
+            "https://127.0.0.1",
+            "http://0.0.0.0",
+            "https://0.0.0.0",
+        )
+    )
+
+
+def _require_oauth_provider(
+    provider: str,
+    client_id: Optional[str],
+    client_secret: Optional[str],
+    redirect_uri: Optional[str],
+) -> None:
+    missing = []
+    if not client_id:
+        missing.append(f"{provider}_CLIENT_ID")
+    if not client_secret:
+        missing.append(f"{provider}_CLIENT_SECRET")
+    if not redirect_uri:
+        missing.append(f"{provider}_REDIRECT_URI")
+
+    if missing:
+        raise RuntimeError(
+            f"Missing OAuth configuration for {provider}: {', '.join(missing)}"
+        )
+
+    if _is_localhost_url(redirect_uri):
+        raise RuntimeError(
+            f"{provider}_REDIRECT_URI must not point to localhost in production."
+        )
+
+
+def _validate_optional_oauth_provider(
+    provider: str,
+    client_id: Optional[str],
+    client_secret: Optional[str],
+    redirect_uri: Optional[str],
+) -> None:
+    if client_id or client_secret:
+        _require_oauth_provider(provider, client_id, client_secret, redirect_uri)
+
+
+def validate_startup_settings(settings: Settings) -> None:
+    if settings.ENVIRONMENT.lower() == "test":
+        return
+    if settings.is_production:
+        secret_key = settings.SECRET_KEY
+        if _is_default_secret_key(secret_key):
+            raise RuntimeError(
+                "SECRET_KEY is missing or uses a default placeholder. Set a strong random value."
+            )
+
+        if len(secret_key.strip()) < MIN_SECRET_KEY_LENGTH:
+            raise RuntimeError(
+                f"SECRET_KEY must be at least {MIN_SECRET_KEY_LENGTH} characters."
+            )
+
+        if not settings.ALLOWED_ORIGINS:
+            raise RuntimeError("ALLOWED_ORIGINS must be set in production.")
+        if "*" in settings.ALLOWED_ORIGINS:
+            raise RuntimeError(
+                "Wildcard '*' is not allowed in ALLOWED_ORIGINS for production."
+            )
+
+        if settings.OAUTH_ENABLED:
+            _require_oauth_provider(
+                "GOOGLE",
+                settings.GOOGLE_CLIENT_ID,
+                settings.GOOGLE_CLIENT_SECRET,
+                settings.GOOGLE_REDIRECT_URI,
+            )
+            _validate_optional_oauth_provider(
+                "GITHUB",
+                settings.GITHUB_CLIENT_ID,
+                settings.GITHUB_CLIENT_SECRET,
+                settings.GITHUB_REDIRECT_URI,
+            )
+            _validate_optional_oauth_provider(
+                "OSM",
+                settings.OSM_CLIENT_ID,
+                settings.OSM_CLIENT_SECRET,
+                settings.OSM_REDIRECT_URI,
+            )
+    else:
+        secret_key = settings.SECRET_KEY
+        if _is_default_secret_key(secret_key):
+            logging.getLogger(__name__).warning(
+                "SECRET_KEY is missing or uses a default placeholder. "
+                "Set a strong random value before deploying to production."
+            )
+        elif len(secret_key.strip()) < MIN_SECRET_KEY_LENGTH:
+            logging.getLogger(__name__).warning(
+                "SECRET_KEY is shorter than %s characters. "
+                "Set a strong random value before deploying to production.",
+                MIN_SECRET_KEY_LENGTH,
+            )
